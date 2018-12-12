@@ -5,14 +5,25 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/jinzhu/copier"
-	"github.com/sirupsen/logrus"
+	logger "github.com/sirupsen/logrus"
 )
 
-//http://localhost:8086/write?db=mydb
+func init() {
+	// Log as JSON instead of the default ASCII formatter.
+	logger.SetFormatter(&logger.JSONFormatter{})
+
+	// Output to stdout instead of the default stderr
+	// Can be any io.Writer, see below for File example
+	logger.SetOutput(os.Stdout)
+
+	// Only log the warning severity or above.
+	logger.SetLevel(logger.ErrorLevel)
+}
 
 type DatabaseDescriptor struct {
 	username    string
@@ -33,83 +44,81 @@ type Metric struct {
 	measurement string
 	tags        map[string]string
 	fields      map[string]string
-	timestamp   time.Time
+	timestamp   int64
 }
 
-func (m Metric) copyMetric() Metric {
-	newMetric := Metric{}
-	if err := copier.Copy(&newMetric, m); err != nil {
-		logrus.Error("Could not copy the metrics")
-	}
-	return newMetric
+func makeTimestamp() int64 {
+	return time.Now().UnixNano() / int64(time.Millisecond)
 }
 
 func (m Metric) flatten() string {
 	var b bytes.Buffer
 	b.WriteString(m.measurement)
-	for t, v := range m.tags {
-		b.WriteString(fmt.Sprintf("%s=%s", t, v))
+	b.WriteString(",")
+
+	tagsSlice := make([]string, 0)
+	fieldsSlice := make([]string, 0)
+
+	for t, v1 := range m.tags {
+		tagsSlice = append(tagsSlice, fmt.Sprintf("%s=%s", t, v1))
 	}
-	for f, v := range m.tags {
-		b.WriteString(fmt.Sprintf("%s=%s", f, v))
+	b.WriteString(strings.Join(tagsSlice, ","))
+
+	b.WriteString(" ")
+
+	for f, v2 := range m.fields {
+		fieldsSlice = append(fieldsSlice, fmt.Sprintf("%s=%s", f, v2))
 	}
-	b.WriteString(m.timestamp.String())
+	b.WriteString(strings.Join(fieldsSlice, ","))
+	b.WriteString(" ")
+
+	b.WriteString(strconv.FormatInt(m.timestamp, 10))
 	return b.String()
 }
 
 func (m Metric) publishToDB(dbURL string) {
-	body := strings.NewReader(m.flatten())
+	metricData := m.flatten()
+	logger.Infof("received: %s", metricData)
+	body := strings.NewReader(metricData)
 	req, err := http.NewRequest("POST", dbURL, body)
 	if err != nil {
-		logrus.Error("Could not create new post request to influx")
+		logger.Error("Could not create new post request to influx")
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		logrus.Error("Could not send the request to influx")
+	var netClient = &http.Client{
+		Timeout: time.Second * 10,
 	}
 
-	// defer the closing of our inputJSONFile so that we can parse it later on
-	defer func() {
-		err := resp.Body.Close()
-		if err != nil {
-			logrus.Errorf("failed to close the file %v", err)
-		}
-	}()
+	resp, err := netClient.Do(req)
+	if err != nil {
+		logger.Errorf("%v", err)
+	}
+	if resp != nil {
+		// defer the closing of our inputJSONFile so that we can parse it later on
+		defer func() {
+			err := resp.Body.Close()
+			if err != nil {
+				logger.Errorf("failed to close the file %v", err)
+			}
+		}()
+	}
 }
 
 func degreeToRads(degree float64) float64 {
 	return degree * (math.Pi / 180)
 }
 
-func main() {
+func signalProducer(in chan float64) {
+	for i := 0; i < 360; i++ {
+		in <- math.Sin(degreeToRads(float64(i)))
+	}
+	close(in)
+}
 
-	// put values into channel
-	c := make(chan float64)
-
-	go func(a chan float64) {
-		for i := 0; i <= 360; i++ {
-			a <- math.Sin(degreeToRads(float64(i)))
-		}
-		close(a)
-	}(c)
-
-	// get the values from the channel, generate metrics and publish the metrics
-	database := DatabaseDescriptor{dbHostName: "localhost", dbPort: "8086", dbName: "iot_field_metrics", dbPrecision: "ms"}
-
-	databaseURL := database.getDatabaseURL()
-
-	logrus.Info("Ready to send data to %s", databaseURL)
-
-	tags := map[string]string{"location": "colombia", "aggregator": "agg-col-001"}
-
-	m := make(chan Metric)
-
-	go func(values chan float64, metrics chan Metric) {
-		value := <-values
-
-		logrus.Infof("Generating Metric for value: %.4f", value)
+func metricsProducer(in chan float64, out chan Metric, tags map[string]string) {
+	for value := range in {
+		logger.Debug("Generating Metric for value: %.4f", value)
 
 		signal := fmt.Sprintf("%.4f", value)
 
@@ -117,19 +126,37 @@ func main() {
 			measurement: "weather",
 			tags:        tags,
 			fields:      map[string]string{"temperature": signal},
-			timestamp:   time.Now(),
+			timestamp:   makeTimestamp(),
 		}
 
-		metrics <- mt
-	}(c, m)
+		out <- mt
+	}
+	close(out)
+}
 
-	<-c
-	<-m
+func metricsPublisher(metrics chan Metric, dbURL string) {
+	for metric := range metrics {
+		metric.publishToDB(dbURL)
+	}
+}
 
-	//go func() {
-	//	metric := <- m
-	//	logrus.Info("Processing Metric: %v", metric)
-	//	metric.publishToDB(databaseURL)
-	//}()
+func main() {
 
+	// put values into channel
+	signalValues := make(chan float64)
+	metrics := make(chan Metric)
+
+	go signalProducer(signalValues)
+
+	tags := map[string]string{"location": "colombia", "aggregator": "agg-col-001"}
+	go metricsProducer(signalValues, metrics, tags)
+
+	// get the values from the channel, generate metrics and publish the metrics
+	database := DatabaseDescriptor{dbHostName: "localhost", dbPort: "8086", dbName: "iot_field_metrics", dbPrecision: "ms"}
+
+	databaseURL := database.getDatabaseURL()
+
+	logger.Info("Ready to send data to %s", databaseURL)
+
+	metricsPublisher(metrics, databaseURL)
 }
