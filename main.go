@@ -25,6 +25,7 @@ func init() {
 	logger.SetLevel(logger.ErrorLevel)
 }
 
+// DatabaseDescriptor represents all the parameters needed to perform a successful connection to the database
 type DatabaseDescriptor struct {
 	username    string
 	password    string
@@ -118,7 +119,7 @@ func signalProducer(in chan float64) {
 
 func metricsProducer(in chan float64, out chan Metric, tags map[string]string) {
 	for value := range in {
-		logger.Debug("Generating Metric for value: %.4f", value)
+		logger.Debugf("Generating Metric for value: %.4f", value)
 
 		signal := fmt.Sprintf("%.4f", value)
 
@@ -128,6 +129,7 @@ func metricsProducer(in chan float64, out chan Metric, tags map[string]string) {
 			fields:      map[string]string{"temperature": signal},
 			timestamp:   makeTimestamp(),
 		}
+		time.Sleep(500 * time.Microsecond)
 
 		out <- mt
 	}
@@ -156,7 +158,7 @@ func main() {
 
 	databaseURL := database.getDatabaseURL()
 
-	logger.Info("Ready to send data to %s", databaseURL)
+	logger.Infof("Ready to send data to %s", databaseURL)
 
 	metricsPublisher(metrics, databaseURL)
 }
